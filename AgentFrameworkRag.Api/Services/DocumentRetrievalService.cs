@@ -6,19 +6,29 @@ using AgentFrameworkRag.Api.Models;
 
 namespace AgentFrameworkRag.Api.Services;
 
+public sealed record RetrievedChunk(
+    string DocumentName,
+    int ChunkIndex,
+    int PageNumber,
+    string Content,
+    double Score);
+
 public sealed record RetrievalResult(
     IReadOnlyList<SourceReference> Sources,
+    IReadOnlyList<RetrievedChunk> Chunks,
     string ContextText,
     string DocumentNames,
     bool HasRelevantContext);
 
+// Non-MAF: vector search engine (embed, score filter, diversify, token budget).
+// Invoked by DocumentSearchAdapter when the MAF agent calls search_documents.
 public sealed class DocumentRetrievalService(
     IEmbeddingGenerator<string, Embedding<float>> embedder,
     VectorStore vectorStore,
     DocumentRegistry registry,
     QueryContextualizer contextualizer,
     IOptions<RagOptions> opts,
-    ILogger<DocumentRetrievalService> logger)
+    ILogger<DocumentRetrievalService> logger) : IDocumentRetrievalService
 {
     public async Task<RetrievalResult> RetrieveAsync(
         string message,
@@ -27,7 +37,7 @@ public sealed class DocumentRetrievalService(
     {
         if (!registry.HasDocuments)
         {
-            return new RetrievalResult([], string.Empty, string.Empty, false);
+            return new RetrievalResult([], [], string.Empty, string.Empty, false);
         }
 
         var queryForRetrieval = await contextualizer.ContextualizeAsync(message, history, ct);
@@ -51,6 +61,7 @@ public sealed class DocumentRetrievalService(
         {
             return new RetrievalResult(
                 [],
+                [],
                 string.Empty,
                 string.Join(", ", registry.GetAll()),
                 false);
@@ -58,6 +69,7 @@ public sealed class DocumentRetrievalService(
 
         var contextParts = new List<string>();
         var sources = new List<SourceReference>();
+        var retrievedChunks = new List<RetrievedChunk>();
         int usedTokens = 0;
         var seenSourceKeys = new HashSet<(string, int)>();
 
@@ -69,6 +81,14 @@ public sealed class DocumentRetrievalService(
             contextParts.Add(chunk.Content);
             usedTokens += chunkTokens;
 
+            var roundedScore = Math.Round(score, 3);
+            retrievedChunks.Add(new RetrievedChunk(
+                chunk.DocumentName,
+                chunk.ChunkIndex,
+                chunk.PageNumber,
+                chunk.Content,
+                roundedScore));
+
             var key = (chunk.DocumentName, chunk.PageNumber);
             if (seenSourceKeys.Add(key))
             {
@@ -78,13 +98,14 @@ public sealed class DocumentRetrievalService(
                     chunk.ChunkIndex,
                     chunk.PageNumber,
                     excerpt,
-                    Math.Round(score, 3)));
+                    roundedScore));
             }
         }
 
         if (contextParts.Count == 0)
         {
             return new RetrievalResult(
+                [],
                 [],
                 string.Empty,
                 string.Join(", ", registry.GetAll()),
@@ -99,7 +120,7 @@ public sealed class DocumentRetrievalService(
             sources.Count,
             contextParts.Count);
 
-        return new RetrievalResult(sources, context, docNames, true);
+        return new RetrievalResult(sources, retrievedChunks, context, docNames, true);
     }
 
     private static List<(DocumentChunk Chunk, double Score)> DiversifyAndSelect(

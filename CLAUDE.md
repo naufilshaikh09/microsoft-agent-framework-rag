@@ -25,6 +25,7 @@ Vite dev server at `http://localhost:5173`.
 ### Build
 ```bash
 dotnet build                          # .NET solution
+dotnet test                           # unit tests
 cd react-frontend && npm run build    # React (tsc + vite build)
 ```
 
@@ -46,7 +47,9 @@ cd react-frontend && npm install
 ## Architecture
 
 ### Overview
-This is a RAG (Retrieval-Augmented Generation) chat app. Documents are uploaded, chunked, embedded via OpenAI, stored in a vector store, and retrieved as context for chat queries. Chat is powered by Microsoft Agent Framework agents.
+This is an agentic RAG chat app. Documents are uploaded, chunked, embedded via OpenAI, stored in a vector store, and searched on-demand by a MAF agent via the `search_documents` tool. Chat is powered by Microsoft Agent Framework agents with `TextSearchProvider`.
+
+**Component guide:** see [docs/FEATURES.md](docs/FEATURES.md) for what each part does and why (MAF vs non-MAF).
 
 ### .NET Aspire orchestration (`AgentFrameworkRag/AppHost.cs`)
 The Aspire AppHost is the single entry point for development. It registers:
@@ -67,9 +70,11 @@ Minimal API project targeting .NET 10. Key wiring in `Program.cs`:
 - `DocumentEndpoints` — `GET /api/documents`, `POST /api/documents/upload`, `DELETE /api/documents/{name}`
 
 **RAG pipeline (`Services/` + `Agents/`):**
-- `RagService` — orchestrates agents: uses a general-knowledge agent when no documents are indexed, otherwise creates a document agent per request
-- `RagAgentFactory` — builds `AIAgent` instances via `Microsoft.Agents.AI`; document agent uses `DocumentRagContextProvider` to inject retrieved chunks
-- `DocumentRagContextProvider` — `AIContextProvider` that supplies retrieved document context to the agent
+- `RagService` — routes to general or document agent; multiplexes SSE source events with agent text streaming
+- `RagAgentFactory` — builds `AIAgent` instances; document agent uses MAF `TextSearchProvider` with `OnDemandFunctionCalling`
+- `DocumentSearchAdapter` — bridges `DocumentRetrievalService` to `TextSearchProvider`; publishes sources to `SourceCollector`
+- `SourceCollector` — per-request channel for mid-stream source citation SSE events
+- `ChatRequestContext` — scoped request state (message + history) for query contextualization during tool calls
 - `DocumentRetrievalService` — embeds the query, searches top-k chunks, filters by relevance score
 - `DocumentIndexerService` — chunks, embeds, and stores documents in the vector store
 - `QueryContextualizer` — rewrites follow-up questions using conversation history for better retrieval

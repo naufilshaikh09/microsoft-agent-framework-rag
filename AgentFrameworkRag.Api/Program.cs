@@ -65,8 +65,11 @@ else
 builder.Services.AddSingleton<DocumentRegistry>();
 builder.Services.AddSingleton<ITextExtractor, PlainTextExtractor>();
 builder.Services.AddSingleton<ITextExtractor, PdfTextExtractor>();
-builder.Services.AddScoped<RetrievalState>();
+builder.Services.AddScoped<ChatRequestContext>();
+builder.Services.AddScoped<SourceCollector>();
+builder.Services.AddScoped<DocumentSearchAdapter>();
 builder.Services.AddScoped<QueryContextualizer>();
+builder.Services.AddScoped<IDocumentRetrievalService, DocumentRetrievalService>();
 builder.Services.AddScoped<DocumentRetrievalService>();
 builder.Services.AddScoped<DocumentIndexerService>();
 builder.Services.AddScoped<RagAgentFactory>();
