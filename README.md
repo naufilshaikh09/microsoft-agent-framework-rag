@@ -1,24 +1,273 @@
 # AgentFrameworkRag
 
-A production-quality RAG (Retrieval-Augmented Generation) chat application built with:
+An **agentic RAG** chat app: upload documents, ask questions, get streamed answers with source citations. The model decides **when** to search via MAF `TextSearchProvider` and the `search_documents` tool.
 
-- **.NET Aspire** — orchestration, telemetry, service discovery
-- **Microsoft Agent Framework** — agent-based chat via `Microsoft.Agents.AI` and `Microsoft.Extensions.AI` (OpenAI primary, Azure OpenAI optional)
-- **ASP.NET Core** — minimal API with SSE streaming
-- **React 19 + Vite + TypeScript** — dark-themed chat UI
-- **Tailwind CSS v4** — styling
+| Layer | Stack |
+|---|---|
+| Orchestration | .NET Aspire |
+| Agents | Microsoft Agent Framework (`Microsoft.Agents.AI` 1.20) |
+| API | ASP.NET Core + SSE streaming |
+| AI | OpenAI / Azure OpenAI |
+| Vector store | InMemory or Qdrant |
+| Frontend | React 19, Vite, TypeScript |
+
+> **Component details:** [docs/FEATURES.md](docs/FEATURES.md) — MAF vs non-MAF per file.
+
+---
+
+## How it works (visual)
+
+### Agentic chat — the main flow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant RS as RagService
+    participant Agent as document-assistant
+    participant TSP as TextSearchProvider
+    participant Search as DocumentRetrievalService
+
+    User->>RS: message + history
+    RS->>Agent: run (no pre-fetch)
+    alt needs document info
+        Agent->>TSP: search_documents(query)
+        TSP->>Search: vector search
+        Search-->>TSP: chunks + scores
+        TSP-->>User: SSE sources (mid-stream)
+        TSP-->>Agent: tool result
+    else greeting or unrelated
+        Note over Agent: skips search_documents
+    end
+    Agent-->>User: streamed answer
+```
+
+### Classic RAG vs agentic RAG (what changed)
+
+**Before — always retrieve first:**
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant RS as RagService
+    participant Search as Retrieval
+    participant Agent as AIAgent
+
+    User->>RS: message
+    RS->>Search: RetrieveAsync (always)
+    Search-->>RS: chunks
+    alt no relevant chunks
+        RS-->>User: static reply (no LLM)
+    else
+        RS->>Agent: run with injected context
+        Agent-->>User: answer
+    end
+```
+
+**Now — agent decides when to search:**
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant RS as RagService
+    participant Agent as AIAgent
+    participant TSP as TextSearchProvider
+
+    User->>RS: message
+    RS->>Agent: run (no pre-fetch)
+    opt agent calls search_documents
+        Agent->>TSP: search tool
+        TSP-->>User: SSE sources
+        TSP-->>Agent: results
+    end
+    Agent-->>User: streamed answer
+```
+
+### Which agent runs?
+
+```mermaid
+flowchart TD
+    Start([User sends message]) --> HasDocs{Documents indexed?}
+    HasDocs -->|No| General[general-assistant<br/>no tools]
+    HasDocs -->|Yes| Doc[document-assistant<br/>search_documents tool]
+    General --> Stream[Stream answer]
+    Doc --> Decide{Model needs docs?}
+    Decide -->|Yes| Tool[search_documents]
+    Decide -->|No| Stream
+    Tool --> Sources[SSE source pills]
+    Sources --> Stream
+    Stream --> Done([Done])
+```
+
+### What the UI receives (SSE timeline)
+
+```mermaid
+sequenceDiagram
+    participant API
+    participant UI as React UI
+
+    Note over API,UI: Path A — search happened
+    API->>UI: event sources → citation pills
+    API->>UI: data token
+    API->>UI: data token
+    API->>UI: data [DONE]
+
+    Note over API,UI: Path B — no search (e.g. hello)
+    API->>UI: data token
+    API->>UI: data token
+    API->>UI: data [DONE]
+```
+
+---
+
+## Architecture
+
+### System map
+
+```mermaid
+flowchart TB
+    subgraph browser [Browser]
+        UI[React UI]
+    end
+
+    subgraph aspire [Aspire]
+        FE[Vite :5173]
+        API[API]
+        QD[(Qdrant)]
+    end
+
+    OAI[OpenAI / Azure]
+
+    UI --> FE -->|/api| API
+    API --> OAI
+    API --> QD
+```
+
+### Code layers
+
+```mermaid
+flowchart LR
+    subgraph ui [UI + API]
+        React[React]
+        EP[Endpoints]
+    end
+
+    subgraph maf [MAF]
+        RS[RagService]
+        AG[AIAgent]
+        TSP[TextSearchProvider]
+    end
+
+    subgraph bridge [Bridge]
+        DSA[DocumentSearchAdapter]
+        SC[SourceCollector]
+    end
+
+    subgraph data [Data plane]
+        IDX[Indexer]
+        RET[Retrieval]
+        VS[(Vectors)]
+    end
+
+    React --> EP --> RS --> AG --> TSP
+    TSP --> DSA --> RET --> VS
+    DSA --> SC --> React
+    EP --> IDX --> VS
+```
+
+| Layer | MAF? |
+|---|---|
+| UI + Endpoints | No |
+| Agent + TextSearchProvider | **Yes** |
+| Adapter + SourceCollector | Bridge |
+| Indexer + Retrieval + Vectors | No |
+
+---
+
+## Request flows
+
+### Upload a document
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant API
+    participant Index as Indexer
+    participant VS as VectorStore
+
+    User->>API: POST /documents/upload
+    API->>API: extract text + chunk
+    API->>Index: embed chunks
+    Index->>VS: store vectors
+    API-->>User: fileName + chunk count
+```
+
+### Chat with search (full path)
+
+```mermaid
+sequenceDiagram
+    participant UI as React
+    participant RS as RagService
+    participant Agent
+    participant TSP as TextSearchProvider
+    participant RET as Retrieval
+    participant OAI as OpenAI
+
+    UI->>RS: POST /chat/stream
+    RS->>Agent: RunStreamingAsync
+    Agent->>OAI: completion + tools
+    OAI-->>Agent: call search_documents
+    Agent->>TSP: tool invoke
+    TSP->>RET: embed + vector search
+    RET-->>TSP: top chunks
+    TSP-->>UI: SSE sources
+    TSP-->>Agent: tool result
+    Agent->>OAI: completion with context
+    loop tokens
+        OAI-->>UI: streamed text
+    end
+```
+
+### Chat without search
+
+```mermaid
+sequenceDiagram
+    participant UI as React
+    participant Agent
+    participant OAI as OpenAI
+
+    UI->>Agent: "Hi there"
+    Agent->>OAI: completion
+    Note over Agent,OAI: no tool call
+    OAI-->>UI: streamed reply
+```
+
+### No documents indexed
+
+```mermaid
+sequenceDiagram
+    participant UI as React
+    participant RS as RagService
+    participant Agent as general-assistant
+    participant OAI as OpenAI
+
+    UI->>RS: POST /chat/stream
+    RS->>Agent: no tools
+    Agent->>OAI: general knowledge
+    OAI-->>UI: streamed reply
+```
 
 ---
 
 ## Features
 
-- **Multi-turn conversation memory** — full chat history passed to the LLM; follow-up questions work naturally
-- **Semantic-aware chunking** — text splits at paragraph → sentence → word boundaries, preserving meaning
-- **Source citations** — every response includes source pills showing which document (and page) answered the question
-- **Document management** — upload, list, and delete documents; duplicate uploads are rejected (409)
-- **Relevance filtering** — chunks below cosine score 0.3 are excluded from context
-- **Context token budget** — top-k chunks are trimmed to fit within 3,000 tokens
-- **Persistent vector store (optional)** — swap `InMemory` for Qdrant via a single config flag; Aspire provisions the container automatically
+- **Agentic RAG** — model chooses when to call `search_documents`
+- **Live citations** — source pills before answer text streams
+- **Multi-turn** — last 10 messages sent with each request
+- **Semantic chunking** — 800 chars, 150 overlap
+- **Relevance filter** — cosine score ≥ 0.3
+- **Token budget** — ~3,000 tokens of context
+- **Bounded tools** — max 3 search roundtrips per request
+- **Qdrant optional** — persistent vectors via Aspire
 
 ---
 
@@ -30,238 +279,129 @@ A production-quality RAG (Retrieval-Augmented Generation) chat application built
 
 ---
 
-## First-time Setup
-
-### 1. Set your OpenAI API key
+## First-time setup
 
 ```bash
+# 1. API key
 cd AgentFrameworkRag.Api
 dotnet user-secrets set "Ai:OpenAI:ApiKey" "sk-your-key-here"
 cd ..
-```
 
-### 2. Install npm dependencies
+# 2. Frontend deps
+cd react-frontend && npm install && cd ..
 
-```bash
-cd react-frontend
-npm install
-cd ..
-```
-
-### 3. Restore .NET packages
-
-```bash
+# 3. Restore
 dotnet restore
 ```
 
 ---
 
-## Running the Application
-
-Run everything via the Aspire AppHost — it starts the API and React dev server together:
+## Running the application
 
 ```bash
 cd AgentFrameworkRag
 dotnet run
 ```
 
-The Aspire dashboard opens automatically. Both services are listed with live logs.
-
 | Service | URL |
 |---|---|
 | Aspire dashboard | https://localhost:17181 |
 | React frontend | http://localhost:5173 |
 | API Reference (Scalar) | http://localhost:5123/scalar/v1 |
-| API health check | http://localhost:5123/health |
+| Health check | http://localhost:5123/health |
 
-> The exact API port is dynamically assigned by Aspire. `5123` is the default when running the API standalone. Vite proxies `/api` to the correct URL automatically.
+```bash
+cd AgentFrameworkRag.Api && dotnet run    # API only
+cd react-frontend && npm run dev          # frontend only
+dotnet test                                # unit tests
+```
 
 ---
 
 ## Testing the API
 
-### Health check
-
 ```bash
+# Health
 curl http://localhost:5123/health
-```
 
-### Non-streaming chat (with optional history)
-
-```bash
-curl -X POST http://localhost:5123/api/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "What is RAG?", "history": []}'
-# {"reply":"...", "sources":[{"documentName":"...","chunkIndex":0,"pageNumber":1,"excerpt":"..."}]}
-```
-
-### Streaming chat (SSE)
-
-```bash
+# Stream chat
 curl -N -X POST http://localhost:5123/api/chat/stream \
   -H "Content-Type: application/json" \
   -d '{"message": "Summarise the uploaded document", "history": []}'
-# event: sources
-# data: [{"documentName":"report.pdf","chunkIndex":0,"pageNumber":2,"excerpt":"..."}]
-#
-# data: The document covers...
-# data: [DONE]
-```
 
-### List documents
+# Upload
+curl -X POST http://localhost:5123/api/documents/upload -F "file=@/path/to/doc.pdf"
 
-```bash
+# List / delete
 curl http://localhost:5123/api/documents
-# ["report.pdf","notes.txt"]
+curl -X DELETE http://localhost:5123/api/documents/doc.pdf
 ```
-
-### Upload a document
-
-```bash
-curl -X POST http://localhost:5123/api/documents/upload \
-  -F "file=@/path/to/document.pdf"
-# 200 OK: {"fileName":"document.pdf","chunks":42}
-# 409 Conflict if already indexed — delete first
-```
-
-### Delete a document
-
-```bash
-curl -X DELETE http://localhost:5123/api/documents/document.pdf
-# 204 No Content
-```
-
-### API Reference (Scalar)
-
-Open `http://localhost:5123/scalar/v1` to explore and test all endpoints interactively.
 
 ---
 
 ## Using the React UI
 
 1. Open `http://localhost:5173`
-2. Upload one or more documents using the sidebar panel (`.txt`, `.md`, `.csv`, `.pdf` supported)
-3. Ask questions — responses stream in token-by-token with source citations below each answer
-4. Continue the conversation naturally; the LLM has full context of prior messages
-5. Click **Stop** during streaming to cancel
-6. Delete documents from the sidebar; re-upload the same file after deletion
+2. Upload documents in the sidebar
+3. Ask a question — source pills appear, then the streamed answer
+4. Try a follow-up or say "hello" (no search)
+5. Use **Stop** to cancel streaming
 
 ---
 
-## Switching to Azure OpenAI
+## Configuration
 
-1. In `AgentFrameworkRag.Api/appsettings.json`, change the provider:
+### Azure OpenAI
 
 ```json
-{
-  "Ai": {
-    "Provider": "AzureOpenAI"
-  }
-}
+{ "Ai": { "Provider": "AzureOpenAI" } }
 ```
 
-2. Set your Azure credentials as user secrets:
-
 ```bash
-cd AgentFrameworkRag.Api
-dotnet user-secrets set "Ai:AzureOpenAI:ApiKey" "your-azure-key"
+dotnet user-secrets set "Ai:AzureOpenAI:ApiKey" "your-key"
 dotnet user-secrets set "Ai:AzureOpenAI:Endpoint" "https://your-resource.openai.azure.com/"
 ```
 
-3. Optionally update deployment names in `appsettings.json`:
+### Qdrant (persistent vectors)
 
 ```json
-{
-  "Ai": {
-    "AzureOpenAI": {
-      "ChatDeployment": "your-gpt4o-deployment-name",
-      "EmbeddingDeployment": "your-embedding-deployment-name"
-    }
-  }
-}
+{ "Ai": { "VectorStore": { "Provider": "Qdrant" } } }
 ```
+
+### RAG tuning (`Ai:Rag`)
+
+| Setting | Default | Description |
+|---|---|---|
+| `TopK` | 6 | Chunks passed to the model |
+| `CandidateK` | 20 | Vector search over-fetch |
+| `MinRelevanceScore` | 0.3 | Min cosine similarity |
+| `MaxContextTokens` | 3000 | Context token budget |
+| `HistoryWindow` | 10 | Turns sent to agent |
+| `MaxToolIterations` | 3 | Max tool roundtrips |
 
 ---
 
-## Persistent Vector Store (Qdrant)
+## Security note
 
-By default the app uses an in-memory vector store — all indexed documents are lost on restart. To persist across restarts, switch to Qdrant:
-
-1. In `AgentFrameworkRag.Api/appsettings.json`:
-
-```json
-{
-  "Ai": {
-    "VectorStore": {
-      "Provider": "Qdrant"
-    }
-  }
-}
-```
-
-2. Run via Aspire (`cd AgentFrameworkRag && dotnet run`) — it provisions the Qdrant container automatically.
-
-On restart, the `DocumentRegistrySeeder` repopulates the in-memory document registry by scanning the Qdrant collection, so previously indexed documents are immediately available.
+Uploaded documents are injected into the LLM context — treat as untrusted input. No authentication; local dev and demos only.
 
 ---
 
-## Project Structure
+## Project structure
 
 ```
 AgentFrameworkRag/
-├── AgentFrameworkRag/                    Aspire AppHost (orchestrator)
-│   ├── AppHost.cs                        Registers API, React frontend, Qdrant
-│   └── AgentFrameworkRag.csproj
-│
-├── AgentFrameworkRag.ServiceDefaults/    Shared Aspire defaults
-│   ├── Extensions.cs                     AddServiceDefaults(), OpenTelemetry, health checks
-│   └── AgentFrameworkRag.ServiceDefaults.csproj
-│
-├── AgentFrameworkRag.Api/                ASP.NET Core Web API
-│   ├── Agents/
-│   │   ├── RagAgentFactory.cs            Creates general and document agents
-│   │   ├── DocumentRagContextProvider.cs Injects retrieved chunks as agent context
-│   │   └── RetrievalState.cs             Per-request retrieval state
-│   ├── Configuration/
-│   │   └── AiOptions.cs                  Provider + VectorStore config model
-│   ├── Endpoints/
-│   │   ├── ChatEndpoints.cs              POST /api/chat, POST /api/chat/stream (SSE)
-│   │   └── DocumentEndpoints.cs          GET/POST/DELETE /api/documents
-│   ├── Models/
-│   │   └── DocumentChunk.cs              Vector store record (embedding + metadata)
-│   ├── Services/
-│   │   ├── RagService.cs                 IRagService — agent orchestration
-│   │   ├── DocumentRetrievalService.cs   Embedding search + relevance filtering
-│   │   ├── DocumentIndexerService.cs     Chunking, embedding, and indexing
-│   │   ├── QueryContextualizer.cs        Rewrites follow-up queries with history
-│   │   ├── TextChunker.cs                Semantic-aware chunking (paragraph/sentence/word)
-│   │   ├── TextExtractor.cs              ITextExtractor — plain text + PDF (PdfPig)
-│   │   ├── DocumentRegistry.cs           Singleton chunk-ID registry for deletion + dedup
-│   │   ├── DocumentRegistrySeeder.cs     Repopulates registry from Qdrant on startup
-│   │   └── TokenEstimator.cs             ~4 chars/token heuristic for context budgeting
-│   └── Program.cs                        App startup, DI, AI client + vector store registration
-│
-├── react-frontend/                       React + Vite + TypeScript
-│   └── src/
-│       ├── api/client.ts                 Typed API client (fetch + SSE, history, delete)
-│       ├── hooks/useChat.ts              Streaming chat state — history slice, sources
-│       ├── components/
-│       │   ├── chat/                     ChatWindow, MessageBubble (source pills), ChatInput
-│       │   ├── documents/                DocumentUpload with delete (React Query)
-│       │   └── layout/                   Sidebar, Header
-│       └── types/index.ts                Message, SourceChunk interfaces
-│
+├── AgentFrameworkRag/                 Aspire AppHost
+├── AgentFrameworkRag.Api/             API + MAF agents + RAG
+├── AgentFrameworkRag.Api.Tests/       xUnit tests
+├── react-frontend/                    React UI
+├── docs/FEATURES.md                   Component guide
 └── README.md
 ```
 
 ---
 
-## Aspire Dashboard
+## Further reading
 
-The Aspire dashboard provides:
-- **Logs** — real-time logs from API and frontend
-- **Traces** — distributed traces showing HTTP requests and outbound calls to OpenAI
-- **Metrics** — request counts, latency histograms
-- **Resources** — start/stop/restart individual services
-
-Access it at: `https://localhost:17181` (accept the self-signed certificate on first visit)
+- [docs/FEATURES.md](docs/FEATURES.md) — per-component what/why, MAF learning checklist
+- [CLAUDE.md](CLAUDE.md) — developer commands

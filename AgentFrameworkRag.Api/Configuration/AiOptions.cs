@@ -56,4 +56,7 @@ public sealed class RagOptions
 
     /// <summary>Max chunks taken from a single document (diversity cap).</summary>
     public int MaxChunksPerDocument { get; init; } = 3;
+
+    /// <summary>Maximum tool-calling roundtrips per chat request.</summary>
+    public int MaxToolIterations { get; init; } = 3;
 }

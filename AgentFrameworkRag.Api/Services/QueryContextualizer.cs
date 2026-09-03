@@ -2,6 +2,9 @@ using Microsoft.Extensions.AI;
 
 namespace AgentFrameworkRag.Api.Services;
 
+// Non-MAF: fixed retrieval preprocessing — rewrites follow-ups for better embeddings.
+// Uses IChatClient directly (not AIAgent) because this is internal to search, not user-facing chat.
+// See docs/FEATURES.md.
 public sealed class QueryContextualizer(
     IChatClient chatClient,
     ILogger<QueryContextualizer> logger)

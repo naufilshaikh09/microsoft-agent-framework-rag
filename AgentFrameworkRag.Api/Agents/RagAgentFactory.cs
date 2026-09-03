@@ -1,11 +1,17 @@
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
+using Microsoft.Extensions.Options;
+using AgentFrameworkRag.Api.Configuration;
 
 namespace AgentFrameworkRag.Api.Agents;
 
+// MAF: agent factory — instructions, TextSearchProvider (search_documents), tool iteration limits.
+// See docs/FEATURES.md for the full MAF vs non-MAF map.
 public sealed class RagAgentFactory(
     IChatClient chatClient,
-    RetrievalState retrievalState)
+    DocumentSearchAdapter searchAdapter,
+    IOptions<RagOptions> opts,
+    ILoggerFactory loggerFactory)
 {
     private const string GeneralInstructions =
         "You are a helpful assistant. Answer questions clearly and concisely. " +
@@ -13,12 +19,16 @@ public sealed class RagAgentFactory(
 
     private const string DocumentInstructions =
         """
-        You are a document assistant. Answer the user's question using ONLY the provided document context.
-        Do not use any knowledge outside the documents. If the answer is not found in the context,
-        respond with exactly: "Sorry, I don't have knowledge about that based on the uploaded documents."
+        You are a document assistant. Uploaded documents are available for search.
+
+        Use the search_documents tool when the user asks about content that may be in their uploaded files.
+        For greetings, small talk, or questions clearly unrelated to uploaded documents, answer directly without searching.
+        When search returns relevant passages, answer using only that information and cite the source document name.
+        If search returns no relevant results, say you could not find that information in the uploaded documents.
         """;
 
     private AIAgent? _generalAgent;
+    private AIAgent? _documentAgent;
 
     public AIAgent GetGeneralAgent()
     {
@@ -35,19 +45,42 @@ public sealed class RagAgentFactory(
         return _generalAgent;
     }
 
-    public AIAgent CreateDocumentAgent()
+    public AIAgent GetDocumentAgent()
     {
-        return chatClient
+        _documentAgent ??= CreateDocumentChatClient()
             .AsAIAgent(new ChatClientAgentOptions
             {
                 Name = "document-assistant",
                 ChatOptions = new() { Instructions = DocumentInstructions },
-                AIContextProviders = [new DocumentRagContextProvider(retrievalState)]
+                AIContextProviders = [CreateTextSearchProvider()]
             })
             .AsBuilder()
             .UseOpenTelemetry(sourceName: "AgentFrameworkRag", configure: cfg => cfg.EnableSensitiveData = false)
             .Build();
+
+        return _documentAgent;
     }
+
+    private IChatClient CreateDocumentChatClient() =>
+        chatClient
+            .AsBuilder()
+            .UseFunctionInvocation(loggerFactory, configure: ficc =>
+                ficc.MaximumIterationsPerRequest = opts.Value.MaxToolIterations)
+            .Build();
+
+    private TextSearchProvider CreateTextSearchProvider() =>
+        new(
+            searchAdapter.SearchAsync,
+            new TextSearchProviderOptions
+            {
+                SearchTime = TextSearchProviderOptions.TextSearchBehavior.OnDemandFunctionCalling,
+                FunctionToolName = "search_documents",
+                FunctionToolDescription =
+                    "Search uploaded documents for relevant passages. " +
+                    "Provide a self-contained search query with enough context for follow-up questions.",
+                CitationsPrompt = "Cite the source document name when answering from search results."
+            },
+            loggerFactory);
 
     public static IEnumerable<ChatMessage> BuildMessages(
         string message,

@@ -26,31 +26,31 @@ public interface IRagService
 
 public sealed class RagService : IRagService
 {
-    private const string NoContextReply =
-        "Sorry, I don't have knowledge about that based on the uploaded documents.";
+    // MAF: picks agent and runs RunStreamingAsync / RunAsync. Does not pre-fetch documents.
+    // SSE source multiplexing is app plumbing (SourceCollector). See docs/FEATURES.md.
 
     private readonly DocumentRegistry _registry;
     private readonly DocumentIndexerService _indexer;
-    private readonly DocumentRetrievalService _retrieval;
     private readonly RagAgentFactory _agentFactory;
-    private readonly RetrievalState _retrievalState;
+    private readonly ChatRequestContext _requestContext;
+    private readonly SourceCollector _sourceCollector;
     private readonly RagOptions _opts;
     private readonly ILogger<RagService> _logger;
 
     public RagService(
         DocumentRegistry registry,
         DocumentIndexerService indexer,
-        DocumentRetrievalService retrieval,
         RagAgentFactory agentFactory,
-        RetrievalState retrievalState,
+        ChatRequestContext requestContext,
+        SourceCollector sourceCollector,
         IOptions<RagOptions> opts,
         ILogger<RagService> logger)
     {
         _registry = registry;
         _indexer = indexer;
-        _retrieval = retrieval;
         _agentFactory = agentFactory;
-        _retrievalState = retrievalState;
+        _requestContext = requestContext;
+        _sourceCollector = sourceCollector;
         _opts = opts.Value;
         _logger = logger;
     }
@@ -71,7 +71,7 @@ public sealed class RagService : IRagService
         catch (Exception ex)
         {
             _logger.LogError(ex, "Failed to build chat context");
-            buildError = "Failed to retrieve context. Please try again.";
+            buildError = "Failed to start chat. Please try again.";
         }
 
         if (buildError is not null)
@@ -81,19 +81,37 @@ public sealed class RagService : IRagService
             yield break;
         }
 
-        yield return new SourcesChunk(plan!.Sources);
+        var agentStream = plan!.Agent.RunStreamingAsync(plan.Messages, plan.Session, cancellationToken: ct);
+        await using var enumerator = agentStream.GetAsyncEnumerator();
 
-        if (plan.IsStatic)
+        try
         {
-            yield return new TextChunk(plan.StaticReply);
-            yield break;
+            while (true)
+            {
+                while (_sourceCollector.Reader.TryRead(out var sources))
+                    yield return new SourcesChunk(sources);
+
+                var moveNextTask = enumerator.MoveNextAsync().AsTask();
+                var sourceTask = _sourceCollector.Reader.WaitToReadAsync(ct).AsTask();
+                var completed = await Task.WhenAny(moveNextTask, sourceTask);
+
+                if (completed == sourceTask)
+                    continue;
+
+                if (!await moveNextTask)
+                    break;
+
+                var update = enumerator.Current;
+                if (!string.IsNullOrEmpty(update.Text))
+                    yield return new TextChunk(update.Text);
+            }
+
+            while (_sourceCollector.Reader.TryRead(out var remaining))
+                yield return new SourcesChunk(remaining);
         }
-
-        await foreach (var update in plan.Agent.RunStreamingAsync(plan.Messages, plan.Session, cancellationToken: ct)
-                                         .WithCancellation(ct))
+        finally
         {
-            if (!string.IsNullOrEmpty(update.Text))
-                yield return new TextChunk(update.Text);
+            _sourceCollector.Complete();
         }
     }
 
@@ -105,11 +123,15 @@ public sealed class RagService : IRagService
         _logger.LogInformation("Chat: {Message}", message);
         var plan = await BuildRunPlanAsync(message, history, ct);
 
-        if (plan.IsStatic)
-            return (plan.StaticReply, plan.Sources);
-
-        var response = await plan.Agent.RunAsync(plan.Messages, plan.Session, cancellationToken: ct);
-        return (response.Text ?? string.Empty, plan.Sources);
+        try
+        {
+            var response = await plan.Agent.RunAsync(plan.Messages, plan.Session, cancellationToken: ct);
+            return (response.Text ?? string.Empty, _sourceCollector.AllSources.ToList());
+        }
+        finally
+        {
+            _sourceCollector.Complete();
+        }
     }
 
     public Task<int> IndexDocumentAsync(string name, IReadOnlyList<PagedTextSegment> segments, CancellationToken ct = default)
@@ -126,45 +148,18 @@ public sealed class RagService : IRagService
         IReadOnlyList<HistoryMessage>? history,
         CancellationToken ct)
     {
+        _requestContext.Message = message;
+        _requestContext.History = history;
+
         var messages = RagAgentFactory.BuildMessages(message, history, _opts.HistoryWindow).ToList();
 
-        if (!_registry.HasDocuments)
-        {
-            var agent = _agentFactory.GetGeneralAgent();
-            var session = await agent.CreateSessionAsync(ct);
-            return ChatRunPlan.ForAgent(agent, session, messages, []);
-        }
+        var agent = _registry.HasDocuments
+            ? _agentFactory.GetDocumentAgent()
+            : _agentFactory.GetGeneralAgent();
 
-        _retrievalState.Message = message;
-        _retrievalState.History = history;
-
-        var retrieval = await _retrieval.RetrieveAsync(message, history, ct);
-        _retrievalState.Result = retrieval;
-
-        if (!retrieval.HasRelevantContext)
-            return ChatRunPlan.Static(NoContextReply, retrieval.Sources);
-
-        var documentAgent = _agentFactory.CreateDocumentAgent();
-        var documentSession = await documentAgent.CreateSessionAsync(ct);
-        return ChatRunPlan.ForAgent(documentAgent, documentSession, messages, retrieval.Sources.ToList());
+        var session = await agent.CreateSessionAsync(ct);
+        return new ChatRunPlan(agent, session, messages);
     }
 
-    private sealed record ChatRunPlan(
-        AIAgent Agent,
-        AgentSession Session,
-        List<ChatMessage> Messages,
-        List<SourceReference> Sources,
-        bool IsStatic,
-        string StaticReply)
-    {
-        public static ChatRunPlan ForAgent(
-            AIAgent agent,
-            AgentSession session,
-            List<ChatMessage> messages,
-            List<SourceReference> sources)
-            => new(agent, session, messages, sources, false, string.Empty);
-
-        public static ChatRunPlan Static(string reply, IReadOnlyList<SourceReference> sources)
-            => new(null!, null!, [], sources.ToList(), true, reply);
-    }
+    private sealed record ChatRunPlan(AIAgent Agent, AgentSession Session, List<ChatMessage> Messages);
 }
