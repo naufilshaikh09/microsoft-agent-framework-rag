@@ -1,0 +1,9 @@
+# Environment secrets
+.env
+
+# Backend build artifacts
+bin/
+obj/
+*.db
+*.db-shm
+*.db-wal
