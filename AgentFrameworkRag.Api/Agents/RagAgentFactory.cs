@@ -23,7 +23,8 @@ public sealed class RagAgentFactory(
 
         Use the search_documents tool when the user asks about content that may be in their uploaded files.
         For greetings, small talk, or questions clearly unrelated to uploaded documents, answer directly without searching.
-        When search returns relevant passages, answer using only that information and cite the source document name.
+        When search returns relevant passages, answer using only that information.
+        Do not include source citations, document names, or [Source: ...] markers in your response — sources are shown separately in the UI.
         If search returns no relevant results, say you could not find that information in the uploaded documents.
         """;
 
@@ -78,7 +79,7 @@ public sealed class RagAgentFactory(
                 FunctionToolDescription =
                     "Search uploaded documents for relevant passages. " +
                     "Provide a self-contained search query with enough context for follow-up questions.",
-                CitationsPrompt = "Cite the source document name when answering from search results."
+                CitationsPrompt = "Do not include citations or [Source: ...] markers in your answer."
             },
             loggerFactory);
 

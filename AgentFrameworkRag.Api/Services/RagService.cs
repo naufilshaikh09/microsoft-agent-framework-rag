@@ -86,20 +86,28 @@ public sealed class RagService : IRagService
 
         try
         {
+            Task<bool>? moveNextTask = null;
+
             while (true)
             {
                 while (_sourceCollector.Reader.TryRead(out var sources))
                     yield return new SourcesChunk(sources);
 
-                var moveNextTask = enumerator.MoveNextAsync().AsTask();
-                var sourceTask = _sourceCollector.Reader.WaitToReadAsync(ct).AsTask();
-                var completed = await Task.WhenAny(moveNextTask, sourceTask);
+                // Only one MoveNextAsync may be in flight — starting a second while sources
+                // arrive first deadlocks the agent stream enumerator and hangs the SSE response.
+                moveNextTask ??= enumerator.MoveNextAsync().AsTask();
 
-                if (completed == sourceTask)
-                    continue;
+                if (!moveNextTask.IsCompleted)
+                {
+                    var sourceTask = _sourceCollector.Reader.WaitToReadAsync(ct).AsTask();
+                    if (await Task.WhenAny(moveNextTask, sourceTask) == sourceTask)
+                        continue;
+                }
 
                 if (!await moveNextTask)
                     break;
+
+                moveNextTask = null;
 
                 var update = enumerator.Current;
                 if (!string.IsNullOrEmpty(update.Text))
